@@ -418,6 +418,20 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    # === Screener ===
+    parser.add_argument(
+        '--screener',
+        action='store_true',
+        help='全市场条件选股模式（仅使用通达信数据源，不调用AI/新闻搜索）'
+    )
+
+    parser.add_argument(
+        '--screener-top',
+        type=int,
+        default=10,
+        help='筛选输出前 N 只（默认 10）'
+    )
+
     return parser.parse_args()
 
 
@@ -1382,6 +1396,30 @@ def main() -> int:
         return 0
 
     try:
+        # 模式S: 全市场条件选股
+        if getattr(args, 'screener', False):
+            logger.info("模式: 全市场条件选股")
+            from src.services.screener_service import ScreenerService
+            from src.notification import NotificationService
+
+            top_n = getattr(args, 'screener_top', 10)
+            service = ScreenerService()
+            results = service.run(top_n=top_n)
+
+            # 控制台输出
+            console_text = service.format_console(results)
+            logger.info("\n%s", console_text)
+
+            # 推送到飞书等已配置的通知渠道
+            if results:
+                notifier = NotificationService()
+                notify_text = service.format_notification(results)
+                notifier.send(notify_text)
+            else:
+                logger.info("[Screener] 暂无符合条件的股票，不推送通知")
+
+            return 0
+
         # 模式0: 回测
         if getattr(args, 'backtest', False):
             logger.info("模式: 回测")
