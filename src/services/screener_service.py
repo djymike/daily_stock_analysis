@@ -4,13 +4,15 @@
 ScreenerService - 全市场条件选股服务
 ===================================
 
-数据源仅使用 Pytdx（通达信直连），不调用新闻搜索或 AI 分析。
+日线行情仅使用 Pytdx（通达信直连），不调用新闻搜索或 AI 分析。
+股票池在通达信列表不完整时，会使用沪深交易所官网等免费公开列表补全。
 
 筛选条件：
   A. MACD ∈ (-3, 0)
   B. 收盘价 > MA60
   C. 最新金叉→死叉之间涨幅 ≥ 40%
   D. 非 ST，且 DIFF ∈ [-2, 3]
+  E. DIFF 标准向上勾头：今日 DIFF > 昨日 DIFF，且昨日 DIFF <= 前日 DIFF
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from io import BytesIO
 from typing import List, Optional, Tuple, Literal
 
 import pandas as pd
@@ -168,6 +171,7 @@ class ScreenerService:
             "筛选项:",
             "• MACD: -3 ~ 0（回调整理阶段）",
             "• DIFF: -2 ~ 3（指标位置不过热）",
+            "• DIFF: 标准向上勾头（今日DIFF > 昨日DIFF，昨日DIFF <= 前日DIFF）",
             "• 股价 > MA60（中期趋势完好）",
             "• 金叉→死叉涨幅 ≥ 40%（有主力拉升痕迹）",
             "• 排除 ST / *ST\n",
@@ -201,7 +205,7 @@ class ScreenerService:
             "  强势股回踩筛选结果",
             "=" * 60,
             f"符合条件: {len(results)} 只",
-            f"条件: 非ST + MACD∈(-3,0) + DIFF∈[-2,3] + 股价>MA60 + 金叉→死叉涨幅≥40%",
+            f"条件: 非ST + MACD∈(-3,0) + DIFF∈[-2,3] + DIFF向上勾头 + 股价>MA60 + 金叉→死叉涨幅≥40%",
             "-" * 60,
         ]
 
@@ -288,6 +292,7 @@ class ScreenerService:
     def _build_pool_from_free_providers(self) -> Tuple[List[Tuple[str, str]], str]:
         """依次使用项目已有免费行情库补全股票池。"""
         providers = [
+            ("exchange_official", self._build_pool_from_exchange_official),
             ("efinance", self._build_pool_from_efinance),
             ("akshare", self._build_pool_from_akshare),
             ("eastmoney_http", self._build_pool_from_eastmoney),
@@ -310,6 +315,132 @@ class ScreenerService:
                 break
 
         return best_pool, best_stats
+
+    def _build_pool_from_exchange_official(self) -> Tuple[List[Tuple[str, str]], str]:
+        """使用沪深交易所官网列表补全股票池，避免东方财富系接口整体不可用。"""
+        records = []
+        stats = []
+
+        try:
+            sh_records = self._fetch_sse_stock_list()
+            records.extend(sh_records)
+            stats.append(f"上交所原始={len(sh_records)}")
+        except Exception as e:
+            logger.warning("[Screener] 上交所股票列表兜底失败: %s", e)
+            stats.append("上交所失败")
+
+        try:
+            sz_records = self._fetch_szse_stock_list()
+            records.extend(sz_records)
+            stats.append(f"深交所原始={len(sz_records)}")
+        except Exception as e:
+            logger.warning("[Screener] 深交所股票列表兜底失败: %s", e)
+            stats.append("深交所失败")
+
+        pool, pool_stats = self._build_pool_from_records(records, ["code"], ["name"], "exchange_official")
+        stats.append(pool_stats)
+        return pool, ", ".join(stats)
+
+    def _fetch_sse_stock_list(self) -> List[dict]:
+        """读取上交所官网 A 股列表。"""
+        params = {
+            "STOCK_TYPE": "1",
+            "REG_PROVINCE": "",
+            "CSRC_CODE": "",
+            "STOCK_CODE": "",
+            "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L",
+            "COMPANY_STATUS": "2,4,5,7,8",
+            "type": "inParams",
+            "isPagination": "true",
+            "pageHelp.cacheSize": "1",
+            "pageHelp.beginPage": "1",
+            "pageHelp.pageSize": "10000",
+            "pageHelp.pageNo": "1",
+            "pageHelp.endPage": "1",
+        }
+        url = "https://query.sse.com.cn/sseQuery/commonQuery.do?" + urllib.parse.urlencode(params)
+        payload = self._fetch_json_with_retry(
+            url,
+            retries=3,
+            headers={
+                "Host": "query.sse.com.cn",
+                "Referer": "https://www.sse.com.cn/assortment/stock/list/share/",
+            },
+        )
+        if payload is None:
+            return []
+
+        rows = payload.get("result") or (payload.get("pageHelp") or {}).get("data") or []
+        records = []
+        for row in rows:
+            records.append({
+                "code": row.get("A_STOCK_CODE") or row.get("SECURITY_CODE_A") or row.get("COMPANY_CODE"),
+                "name": row.get("SEC_NAME_CN") or row.get("COMPANY_ABBR") or row.get("SEC_NAME_FULL"),
+            })
+        return records
+
+    def _fetch_szse_stock_list(self) -> List[dict]:
+        """读取深交所官网 A 股列表。"""
+        params = {
+            "SHOWTYPE": "xlsx",
+            "CATALOGID": "1110",
+            "TABKEY": "tab1",
+            "random": str(time.time()),
+        }
+        url = "https://www.szse.cn/api/report/ShowReport?" + urllib.parse.urlencode(params)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+            "Referer": "https://www.szse.cn/market/product/stock/list/index.html",
+            "Connection": "close",
+        }
+
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    content = response.read()
+                df = pd.read_excel(BytesIO(content))
+                return self._records_from_szse_dataframe(df)
+            except Exception as e:
+                last_error = e
+                time.sleep(min(2, attempt * 0.5))
+
+        raise RuntimeError(last_error)
+
+    @staticmethod
+    def _records_from_szse_dataframe(df: pd.DataFrame) -> List[dict]:
+        """从深交所 xlsx 表格中提取 A 股代码和简称。"""
+        if df is None or df.empty:
+            return []
+
+        code_column = ScreenerService._find_dataframe_column(df, ["A股代码", "A股 代码", "A股"])
+        name_column = ScreenerService._find_dataframe_column(df, ["A股简称", "A股 简称", "简称"])
+        if code_column is None and len(df.columns) > 4:
+            code_column = df.columns[4]
+        if name_column is None and len(df.columns) > 5:
+            name_column = df.columns[5]
+        if code_column is None or name_column is None:
+            return []
+
+        records = []
+        for _, row in df.iterrows():
+            records.append({"code": row.get(code_column), "name": row.get(name_column)})
+        return records
+
+    @staticmethod
+    def _find_dataframe_column(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
+        """按关键字查找 DataFrame 列名，兼容不同接口返回列名。"""
+        for column in df.columns:
+            compact = re.sub(r"\s+", "", str(column))
+            for keyword in keywords:
+                if re.sub(r"\s+", "", keyword) in compact:
+                    return column
+        return None
 
     def _build_pool_from_efinance(self) -> Tuple[List[Tuple[str, str]], str]:
         """使用 efinance 获取 A 股列表，仅取代码和名称。"""
@@ -434,9 +565,9 @@ class ScreenerService:
         return rows
 
     @staticmethod
-    def _fetch_json_with_retry(url: str, retries: int = 3) -> Optional[dict]:
+    def _fetch_json_with_retry(url: str, retries: int = 3, headers: Optional[dict] = None) -> Optional[dict]:
         """带重试的 JSON 请求，供免费行情列表兜底使用。"""
-        headers = {
+        request_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -445,10 +576,12 @@ class ScreenerService:
             "Referer": "https://quote.eastmoney.com/",
             "Connection": "close",
         }
+        if headers:
+            request_headers.update(headers)
         last_error = None
         for attempt in range(1, retries + 1):
             try:
-                request = urllib.request.Request(url, headers=headers)
+                request = urllib.request.Request(url, headers=request_headers)
                 with urllib.request.urlopen(request, timeout=10) as response:
                     return json.loads(response.read().decode("utf-8"))
             except Exception as e:
@@ -530,6 +663,10 @@ class ScreenerService:
         if not (self.DIFF_MIN <= current_dif <= self.DIFF_MAX):
             return None
 
+        # 条件 E: DIFF 标准向上勾头
+        if not self._is_dif_hook_up(dif):
+            return None
+
         # 条件 C: 金叉→死叉涨幅
         crosses = self._detect_crosses(dif, dea, df)
         cross_rise = self._check_cross_rise(close, crosses)
@@ -605,6 +742,20 @@ class ScreenerService:
         return dif, dea, macd
 
     @staticmethod
+    def _is_dif_hook_up(dif: np.ndarray) -> bool:
+        """判断 DIFF 是否标准向上勾头。"""
+        if len(dif) < 3:
+            return False
+
+        before_yesterday = float(dif[-3])
+        yesterday = float(dif[-2])
+        today = float(dif[-1])
+        if np.isnan(before_yesterday) or np.isnan(yesterday) or np.isnan(today):
+            return False
+
+        return today > yesterday and yesterday <= before_yesterday
+
+    @staticmethod
     def _ema(data: np.ndarray, period: int) -> np.ndarray:
         """计算指数移动平均"""
         result = np.zeros_like(data, dtype=float)
@@ -666,6 +817,8 @@ class ScreenerService:
             raw = raw.split(".", 1)[0]
         if raw.startswith(("SH", "SZ", "BJ")):
             raw = raw[2:]
+        if raw.isdigit() and len(raw) <= 6:
+            return raw.zfill(6)
         match = re.search(r"\d{6}", raw)
         return match.group(0) if match else ""
 
@@ -723,6 +876,10 @@ class ScreenerService:
                     logger.debug("[Screener] 线程通达信连接成功: %s:%s", host, port)
                     return session
                 last_error = f"{host}:{port}=connect_false"
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
             except Exception as e:
                 last_error = e
                 try:
