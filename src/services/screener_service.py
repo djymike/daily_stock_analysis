@@ -67,6 +67,7 @@ class ScreenerService:
     MACD_MAX = 0.0
     MAX_WORKERS = 10
     CONNECT_TIMEOUT = float(os.getenv("PYTDX_CONNECT_TIMEOUT", "3"))
+    MIN_EXPECTED_POOL_SIZE = int(os.getenv("SCREENER_MIN_POOL_SIZE", "3000"))
     EXTRA_TDX_HOSTS: List[Tuple[str, int]] = [
         ("114.80.63.12", 7709),
         ("114.80.63.35", 7709),
@@ -212,37 +213,72 @@ class ScreenerService:
         - 深市：000、001、002、003
         - 沪市：600、601、603、605
         """
-        from pytdx.hq import TdxHq_API
-
         hosts = self._tdx_hosts()
+        best_pool: List[Tuple[str, str]] = []
+        best_stats = ""
         failed_hosts = []
 
+        for host, port in hosts:
+            try:
+                pool, stats = self._build_pool_from_host(host, port)
+            except Exception as e:
+                failed_hosts.append(f"{host}:{port}={e}")
+                continue
+
+            if not pool:
+                failed_hosts.append(f"{host}:{port}=empty")
+                continue
+
+            logger.info(
+                "[Screener] 通达信股票池候选: %s:%s 有效=%s, %s",
+                host,
+                port,
+                len(pool),
+                stats,
+            )
+            if len(pool) > len(best_pool):
+                best_pool = pool
+                best_stats = f"{host}:{port}, {stats}"
+
+            if len(best_pool) >= self.MIN_EXPECTED_POOL_SIZE:
+                break
+
+        if not best_pool:
+            logger.error(
+                "[Screener] 无法从任何通达信服务器构建股票池，已尝试 %s 个: %s",
+                len(hosts),
+                "; ".join(failed_hosts[:20]),
+            )
+            return []
+
+        if len(best_pool) < self.MIN_EXPECTED_POOL_SIZE:
+            logger.warning(
+                "[Screener] 股票池数量 %s 低于预期阈值 %s，疑似通达信节点列表不完整；最佳节点: %s",
+                len(best_pool),
+                self.MIN_EXPECTED_POOL_SIZE,
+                best_stats,
+            )
+
+        logger.info("[Screener] 股票池构建完成: 有效=%s, 来源=%s", len(best_pool), best_stats)
+        return best_pool
+
+    def _build_pool_from_host(self, host: str, port: int) -> Tuple[List[Tuple[str, str]], str]:
+        """从单个通达信服务器构建主板股票池。"""
+        from pytdx.hq import TdxHq_API
+
         api = TdxHq_API()
-        connected = False
+        pool_map = {}
+        raw_counts = {0: 0, 1: 0}
+
         try:
-            for host, port in hosts:
-                try:
-                    if api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
-                        connected = True
-                        logger.info("[Screener] 通达信股票池连接成功: %s:%s", host, port)
-                        break
-                    failed_hosts.append(f"{host}:{port}=connect_false")
-                except Exception as e:
-                    failed_hosts.append(f"{host}:{port}={e}")
+            if not api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
+                return [], "connect_false"
 
-            if not connected:
-                logger.error(
-                    "[Screener] 无法连接任何通达信服务器，已尝试 %s 个: %s",
-                    len(hosts),
-                    "; ".join(failed_hosts[:20]),
-                )
-                return []
-
-            pool_map = {}
             for market in (0, 1):
                 start = 0
                 while True:
                     stocks = api.get_security_list(market, start) or []
+                    raw_counts[market] += len(stocks)
                     for stock in stocks:
                         code = str(stock.get('code', ''))
                         name = str(stock.get('name', ''))
@@ -250,7 +286,8 @@ class ScreenerService:
                             continue
                         if not self._is_main_board_stock(market, code):
                             continue
-                        pool_map[code] = name
+                        key = f"{market}:{code}"
+                        pool_map[key] = (code, name)
                     if len(stocks) < PytdxFetcher.SECURITY_LIST_PAGE_SIZE:
                         break
                     start += PytdxFetcher.SECURITY_LIST_PAGE_SIZE
@@ -260,9 +297,10 @@ class ScreenerService:
             except Exception:
                 pass
 
-        pool = list(pool_map.items())
-        logger.info("[Screener] 股票池构建完成: 有效=%s", len(pool))
-        return pool
+        sz_main = sum(1 for key in pool_map if key.startswith("0:"))
+        sh_main = sum(1 for key in pool_map if key.startswith("1:"))
+        stats = f"深市主板={sz_main}, 沪市主板={sh_main}, 深市原始={raw_counts[0]}, 沪市原始={raw_counts[1]}"
+        return list(pool_map.values()), stats
 
     # ==================== 单只股票处理 ====================
 
