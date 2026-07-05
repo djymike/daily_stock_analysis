@@ -62,8 +62,8 @@ class ScreenerResult:
 class ScreenerService:
     """全市场条件选股服务，只使用通达信数据源"""
 
-    MACD_FAST = 12
-    MACD_SLOW = 26
+    MACD_FAST = 10
+    MACD_SLOW = 20
     MACD_SIGNAL = 9
     MIN_TRADING_DAYS = 60
     MIN_RISE_PCT = 0.40
