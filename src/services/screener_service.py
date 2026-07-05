@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -65,7 +66,7 @@ class ScreenerService:
     MIN_RISE_PCT = 0.40
     MACD_MIN = -3.0
     MACD_MAX = 0.0
-    MAX_WORKERS = 10
+    MAX_WORKERS = int(os.getenv("SCREENER_MAX_WORKERS", os.getenv("MAX_WORKERS", "10")))
     CONNECT_TIMEOUT = float(os.getenv("PYTDX_CONNECT_TIMEOUT", "3"))
     MIN_EXPECTED_POOL_SIZE = int(os.getenv("SCREENER_MIN_POOL_SIZE", "3000"))
     EXTRA_TDX_HOSTS: List[Tuple[str, int]] = [
@@ -90,7 +91,10 @@ class ScreenerService:
 
     def __init__(self):
         """初始化筛选服务，直接使用 pytdx 直连通达信"""
-        pass
+        self._thread_local = threading.local()
+        self._session_lock = threading.Lock()
+        self._worker_sessions = []
+        self._preferred_data_hosts: List[Tuple[str, int]] = []
 
     # ==================== 公开接口 ====================
 
@@ -128,9 +132,11 @@ class ScreenerService:
                     elapsed = time.time() - start_time
                     rate = done / elapsed if elapsed > 0 else 0
                     logger.info(
-                        "[Screener] 进度: %s/%s (%.1f%%), 已符合 %s 只, 速率 %.0f 只/秒",
+                        "[Screener] 进度: %s/%s (%.1f%%), 已符合 %s 只, 速率 %.2f 只/秒",
                         done, total, done / total * 100, len(results), rate,
                     )
+
+        self._disconnect_worker_sessions()
 
         elapsed = time.time() - start_time
         results.sort(key=lambda r: r.score, reverse=True)
@@ -216,6 +222,7 @@ class ScreenerService:
         hosts = self._tdx_hosts()
         best_pool: List[Tuple[str, str]] = []
         best_stats = ""
+        best_host: Optional[Tuple[str, int]] = None
         failed_hosts = []
 
         for host, port in hosts:
@@ -239,6 +246,7 @@ class ScreenerService:
             if len(pool) > len(best_pool):
                 best_pool = pool
                 best_stats = f"{host}:{port}, {stats}"
+                best_host = (host, port)
 
             if len(best_pool) >= self.MIN_EXPECTED_POOL_SIZE:
                 break
@@ -260,6 +268,8 @@ class ScreenerService:
             )
 
         logger.info("[Screener] 股票池构建完成: 有效=%s, 来源=%s", len(best_pool), best_stats)
+        if best_host is not None:
+            self._preferred_data_hosts = [best_host] + [item for item in hosts if item != best_host]
         return best_pool
 
     def _build_pool_from_host(self, host: str, port: int) -> Tuple[List[Tuple[str, str]], str]:
@@ -357,16 +367,11 @@ class ScreenerService:
         PytdxFetcher 只实现了 _fetch_raw_data + _normalize_data，
         没有公开 get_daily_data，所以此处直接调用通达信 API。
         """
-        from pytdx.hq import TdxHq_API
-
         market = self._stock_market(code)
-        hosts = self._tdx_hosts()
-
-        for host, port in hosts:
-            api = TdxHq_API()
+        last_error = None
+        for _ in range(2):
             try:
-                if not api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
-                    continue
+                api, host, port = self._get_thread_api()
                 data = api.get_security_bars(
                     category=9,  # 日线
                     market=market,
@@ -375,7 +380,7 @@ class ScreenerService:
                     count=240,  # 约一年交易日，避免最新金叉/死叉窗口过短。
                 )
                 if data is None or len(data) == 0:
-                    continue
+                    return None
 
                 df = api.to_df(data)
                 df["date"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d")
@@ -387,13 +392,12 @@ class ScreenerService:
 
                 return df
             except Exception as e:
-                logger.debug("[Screener] %s 从 %s:%s 获取日线失败: %s", code, host, port, e)
-            finally:
-                try:
-                    api.disconnect()
-                except Exception:
-                    pass
+                last_error = e
+                logger.debug("[Screener] %s 日线获取失败，重置线程连接: %s", code, e)
+                self._reset_thread_api()
 
+        if last_error is not None:
+            logger.debug("[Screener] %s 日线获取最终失败: %s", code, last_error)
         return None
 
     # ==================== MACD 计算 ====================
@@ -464,6 +468,73 @@ class ScreenerService:
             seen.add(key)
             unique_hosts.append(key)
         return unique_hosts
+
+    def _ordered_data_hosts(self) -> List[Tuple[str, int]]:
+        """日线数据优先使用股票池构建成功且数量最完整的节点。"""
+        hosts = self._preferred_data_hosts + self._tdx_hosts()
+        seen = set()
+        result = []
+        for host, port in hosts:
+            key = (str(host).strip(), int(port))
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            result.append(key)
+        return result
+
+    def _get_thread_api(self):
+        """每个筛选线程复用自己的通达信连接，避免每只股票重复 TCP 连接。"""
+        session = getattr(self._thread_local, "tdx_session", None)
+        if session is not None:
+            return session
+
+        from pytdx.hq import TdxHq_API
+
+        last_error = None
+        for host, port in self._ordered_data_hosts():
+            api = TdxHq_API()
+            try:
+                if api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
+                    session = (api, host, port)
+                    self._thread_local.tdx_session = session
+                    with self._session_lock:
+                        self._worker_sessions.append(api)
+                    logger.debug("[Screener] 线程通达信连接成功: %s:%s", host, port)
+                    return session
+                last_error = f"{host}:{port}=connect_false"
+            except Exception as e:
+                last_error = e
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+
+        raise RuntimeError(f"无法连接可用通达信日线服务器: {last_error}")
+
+    def _reset_thread_api(self) -> None:
+        """当前线程的通达信连接异常时断开并在下次请求重连。"""
+        session = getattr(self._thread_local, "tdx_session", None)
+        if session is None:
+            return
+
+        api, _, _ = session
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+        self._thread_local.tdx_session = None
+
+    def _disconnect_worker_sessions(self) -> None:
+        """筛选完成后关闭所有 worker 持有的通达信连接。"""
+        with self._session_lock:
+            sessions = list(self._worker_sessions)
+            self._worker_sessions.clear()
+
+        for api in sessions:
+            try:
+                api.disconnect()
+            except Exception:
+                pass
 
     @staticmethod
     def _pytdx_config_hosts() -> List[Tuple[str, int]]:
