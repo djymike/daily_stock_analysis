@@ -14,9 +14,12 @@ ScreenerService - 全市场条件选股服务
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Literal
@@ -66,7 +69,7 @@ class ScreenerService:
     MIN_RISE_PCT = 0.40
     MACD_MIN = -3.0
     MACD_MAX = 0.0
-    MAX_WORKERS = int(os.getenv("SCREENER_MAX_WORKERS", os.getenv("MAX_WORKERS", "10")))
+    MAX_WORKERS = int(os.getenv("SCREENER_MAX_WORKERS", "10"))
     CONNECT_TIMEOUT = float(os.getenv("PYTDX_CONNECT_TIMEOUT", "3"))
     MIN_EXPECTED_POOL_SIZE = int(os.getenv("SCREENER_MIN_POOL_SIZE", "3000"))
     EXTRA_TDX_HOSTS: List[Tuple[str, int]] = [
@@ -266,11 +269,106 @@ class ScreenerService:
                 self.MIN_EXPECTED_POOL_SIZE,
                 best_stats,
             )
+            em_pool, em_stats = self._build_pool_from_eastmoney()
+            if len(em_pool) > len(best_pool):
+                logger.info("[Screener] 使用东方财富免费列表补全股票池: 有效=%s, %s", len(em_pool), em_stats)
+                best_pool = em_pool
+                best_stats = f"东方财富免费列表, {em_stats}"
 
         logger.info("[Screener] 股票池构建完成: 有效=%s, 来源=%s", len(best_pool), best_stats)
         if best_host is not None:
             self._preferred_data_hosts = [best_host] + [item for item in hosts if item != best_host]
         return best_pool
+
+    def _build_pool_from_eastmoney(self) -> Tuple[List[Tuple[str, str]], str]:
+        """使用东方财富免费行情列表补齐股票池，仅取代码和名称。"""
+        if os.getenv("SCREENER_EASTMONEY_POOL_ENABLED", "true").lower() in ("0", "false", "no"):
+            return [], "disabled"
+
+        markets = [
+            (0, "深市主板", "m:0+t:6"),
+            (1, "沪市主板", "m:1+t:2"),
+        ]
+        pool_map = {}
+        stats = []
+
+        for market, label, fs in markets:
+            rows = self._fetch_eastmoney_list(fs)
+            accepted = 0
+            for row in rows:
+                code = str(row.get("f12", "")).strip()
+                name = str(row.get("f14", "")).strip()
+                if not code or not name:
+                    continue
+                if not self._is_main_board_stock(market, code):
+                    continue
+                pool_map[f"{market}:{code}"] = (code, name)
+                accepted += 1
+            stats.append(f"{label}={accepted}")
+
+        return list(pool_map.values()), ", ".join(stats)
+
+    def _fetch_eastmoney_list(self, fs: str) -> List[dict]:
+        """分页读取东方财富列表接口。"""
+        rows: List[dict] = []
+        page = 1
+        page_size = 100
+
+        while True:
+            params = {
+                "pn": page,
+                "pz": page_size,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f3",
+                "fs": fs,
+                "fields": "f12,f14",
+            }
+            url = "https://push2.eastmoney.com/api/qt/clist/get?" + urllib.parse.urlencode(params)
+            payload = self._fetch_json_with_retry(url, retries=3)
+            if payload is None:
+                logger.warning("[Screener] 东方财富股票列表获取失败 fs=%s page=%s", fs, page)
+                break
+
+            data = payload.get("data") or {}
+            diff = data.get("diff") or []
+            if not diff:
+                break
+
+            rows.extend(diff)
+            total = int(data.get("total") or 0)
+            if len(rows) >= total or len(diff) < page_size:
+                break
+            page += 1
+
+        return rows
+
+    @staticmethod
+    def _fetch_json_with_retry(url: str, retries: int = 3) -> Optional[dict]:
+        """带重试的 JSON 请求，供免费行情列表兜底使用。"""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://quote.eastmoney.com/",
+            "Connection": "close",
+        }
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as e:
+                last_error = e
+                time.sleep(min(2, attempt * 0.5))
+
+        logger.warning("[Screener] JSON 请求失败: %s", last_error)
+        return None
 
     def _build_pool_from_host(self, host: str, port: int) -> Tuple[List[Tuple[str, str]], str]:
         """从单个通达信服务器构建主板股票池。"""

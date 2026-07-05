@@ -264,6 +264,7 @@ jobs:
           PYTDX_PORT: ${{ vars.PYTDX_PORT || secrets.PYTDX_PORT }}
           PYTDX_CONNECT_TIMEOUT: ${{ vars.PYTDX_CONNECT_TIMEOUT || secrets.PYTDX_CONNECT_TIMEOUT || '3' }}
           SCREENER_MIN_POOL_SIZE: ${{ vars.SCREENER_MIN_POOL_SIZE || secrets.SCREENER_MIN_POOL_SIZE || '3000' }}
+          SCREENER_MAX_WORKERS: ${{ vars.SCREENER_MAX_WORKERS || secrets.SCREENER_MAX_WORKERS || '10' }}
           # Longbridge OpenAPI（美股/港股实时行情字段补充；不设则仅 YFinance/AkShare，无 [Longbridge] 调用）
           LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
           LONGBRIDGE_OAUTH_TOKEN_CACHE_B64: ${{ secrets.LONGBRIDGE_OAUTH_TOKEN_CACHE_B64 }}
