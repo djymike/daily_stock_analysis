@@ -101,7 +101,7 @@ class ScreenerService:
 
     # ==================== 公开接口 ====================
 
-    def run(self, top_n: int = 10) -> List[ScreenerResult]:
+    def run(self) -> List[ScreenerResult]:
         """执行全市场条件选股"""
         pool = self._build_pool()
         total = len(pool)
@@ -143,13 +143,12 @@ class ScreenerService:
 
         elapsed = time.time() - start_time
         results.sort(key=lambda r: r.score, reverse=True)
-        top = results[:top_n]
 
         logger.info(
             "[Screener] 筛选完成: 共检查 %s 只, 符合 %s 只, 耗时 %.1f 秒",
             total, len(results), elapsed,
         )
-        return top
+        return results
 
     def format_notification(self, results: List[ScreenerResult]) -> str:
         """格式化为飞书推送的 Markdown 文本"""

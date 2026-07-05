@@ -425,13 +425,6 @@ def parse_arguments() -> argparse.Namespace:
         help='全市场条件选股模式（仅使用通达信数据源，不调用AI/新闻搜索）'
     )
 
-    parser.add_argument(
-        '--screener-top',
-        type=int,
-        default=10,
-        help='筛选输出前 N 只（默认 10）'
-    )
-
     return parser.parse_args()
 
 
@@ -1402,9 +1395,8 @@ def main() -> int:
             from src.services.screener_service import ScreenerService
             from src.notification import NotificationService
 
-            top_n = getattr(args, 'screener_top', 10)
             service = ScreenerService()
-            results = service.run(top_n=top_n)
+            results = service.run()
 
             # 控制台输出
             console_text = service.format_console(results)

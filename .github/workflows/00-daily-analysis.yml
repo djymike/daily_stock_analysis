@@ -18,10 +18,6 @@ on:
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
           - screener      # 全市场条件选股
-      screener_top:
-        description: '筛选输出前 N 只'
-        required: false
-        default: '10'
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -512,7 +508,7 @@ jobs:
           elif [ "$MODE" = "stocks-only" ]; then
             python main.py --no-market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "screener" ]; then
-            python main.py --screener --screener-top ${{ github.event.inputs.screener_top || '10' }}
+            python main.py --screener
           else
             python main.py $FORCE_RUN_ARG
           fi
