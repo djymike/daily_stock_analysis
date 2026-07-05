@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Literal
@@ -67,9 +66,9 @@ class ScreenerService:
     MACD_MAX = 0.0
     MAX_WORKERS = 10
 
-   def __init__(self):
-       """初始化筛选服务，直接使用 pytdx 直连通达信"""
-       pass
+    def __init__(self):
+        """初始化筛选服务，直接使用 pytdx 直连通达信"""
+        pass
 
     # ==================== 公开接口 ====================
 
@@ -188,12 +187,9 @@ class ScreenerService:
         """
         构建筛选池：直连通达信获取全市场股票列表
 
-        排除规则：
-        - 688（科创板）
-        - 300（创业板）
-        - 8（北交所）
-        - 4（老三板）
-        - 2（B股/B股转H股）
+        股票池仅保留沪深主板个股：
+        - 深市：000、001、002、003
+        - 沪市：600、601、603、605
         """
         from pytdx.hq import TdxHq_API
 
@@ -226,7 +222,7 @@ class ScreenerService:
                         name = str(stock.get('name', ''))
                         if not code or not name:
                             continue
-                        if code.startswith(("688", "300", "8", "4", "2")):
+                        if not self._is_main_board_stock(market, code):
                             continue
                         pool_map[code] = name
                     if len(stocks) < PytdxFetcher.SECURITY_LIST_PAGE_SIZE:
@@ -269,8 +265,11 @@ class ScreenerService:
 
         # 条件 C: 金叉→死叉涨幅
         crosses = self._detect_crosses(dif, dea, df)
-        rise_pct = self._check_cross_rise(close, crosses)
-        if rise_pct is None or rise_pct < self.MIN_RISE_PCT:
+        cross_rise = self._check_cross_rise(close, crosses)
+        if cross_rise is None:
+            return None
+        rise_pct, golden_index, death_index = cross_rise
+        if rise_pct < self.MIN_RISE_PCT:
             return None
 
         score = self._calc_score(current_macd, ma60_diff_pct, rise_pct)
@@ -281,67 +280,59 @@ class ScreenerService:
             price=latest_close, ma60=float(ma60),
             ma60_diff_pct=float(ma60_diff_pct),
             rise_since_golden=rise_pct,
-            golden_index=crosses[-2].index if len(crosses) >= 2 else crosses[-1].index,
-            death_index=crosses[-1].index,
+            golden_index=golden_index,
+            death_index=death_index,
         )
 
     # ==================== 数据获取 ====================
 
-   def _fetch_daily_data(self, code: str) -> Optional[pd.DataFrame]:
-       """
-       获取日线数据（直连通达信，绕过 DataFetcherManager）
+    def _fetch_daily_data(self, code: str) -> Optional[pd.DataFrame]:
+        """
+        获取日线数据（直连通达信，绕过 DataFetcherManager）
 
-       PytdxFetcher 只实现了 _fetch_raw_data + _normalize_data，
-       没有公开 get_daily_data，所以此处直接调用通达信 API。
-       """
-       from pytdx.hq import TdxHq_API
+        PytdxFetcher 只实现了 _fetch_raw_data + _normalize_data，
+        没有公开 get_daily_data，所以此处直接调用通达信 API。
+        """
+        from pytdx.hq import TdxHq_API
 
-       # 计算日期范围（90 个自然日→约 60 个交易日，取 120 天确保足够）
-       end = datetime.now()
-       start = end - timedelta(days=120)
-       start_str = start.strftime("%Y-%m-%d")
-       end_str = end.strftime("%Y-%m-%d")
+        market = self._stock_market(code)
+        hosts = _parse_hosts_from_env()
+        if hosts is None:
+            hosts = PytdxFetcher.DEFAULT_HOSTS
 
-       # 判断市场代码
-       if code.startswith(("60", "68")):
-           market = 1  # 上海
-       else:
-           market = 0  # 深圳
+        for host, port in hosts:
+            api = TdxHq_API()
+            try:
+                if not api.connect(host, port, time_out=5):
+                    continue
+                data = api.get_security_bars(
+                    category=9,  # 日线
+                    market=market,
+                    code=code,
+                    start=0,
+                    count=240,  # 约一年交易日，避免最新金叉/死叉窗口过短。
+                )
+                if data is None or len(data) == 0:
+                    continue
 
-       hosts = _parse_hosts_from_env()
-       if hosts is None:
-           hosts = PytdxFetcher.DEFAULT_HOSTS
+                df = api.to_df(data)
+                df["date"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d")
+                df = df.sort_values("date").reset_index(drop=True)
 
-       api = TdxHq_API()
-       try:
-           api.connect(hosts[0][0], hosts[0][1], time_out=5)
-           data = api.get_security_bars(
-               category=9,  # 日线
-               market=market,
-               code=code,
-               start=0,
-               count=80  # 80 条 ≈ 3-4 个月交易日
-           )
-           if data is None or len(data) == 0:
-               return None
+                # 标准化成交量列名，便于后续扩展复用。
+                if "vol" in df.columns:
+                    df = df.rename(columns={"vol": "volume"})
 
-           df = api.to_df(data)
-           df["date"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d")
-           df = df.sort_values("date").reset_index(drop=True)
+                return df
+            except Exception as e:
+                logger.debug("[Screener] %s 从 %s:%s 获取日线失败: %s", code, host, port, e)
+            finally:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
 
-           # 标准化列名
-           if "vol" in df.columns:
-               df = df.rename(columns={"vol": "volume"})
-
-           return df
-       except Exception as e:
-           logger.debug("[Screener] %s 日线获取失败: %s", code, e)
-           return None
-       finally:
-           try:
-               api.disconnect()
-           except Exception:
-               pass
+        return None
 
     # ==================== MACD 计算 ====================
 
@@ -359,11 +350,37 @@ class ScreenerService:
         """计算指数移动平均"""
         result = np.zeros_like(data, dtype=float)
         multiplier = 2.0 / (period + 1)
-        result[:period] = np.nan
-        result[period - 1] = np.mean(data[:period])
-        for i in range(period, len(data)):
+        valid_indexes = np.flatnonzero(~np.isnan(data))
+        if len(valid_indexes) < period:
+            result[:] = np.nan
+            return result
+
+        start = valid_indexes[period - 1]
+        seed_indexes = valid_indexes[:period]
+        result[:start] = np.nan
+        result[start] = np.mean(data[seed_indexes])
+        for i in range(start + 1, len(data)):
+            if np.isnan(data[i]):
+                result[i] = result[i - 1]
+                continue
             result[i] = (data[i] - result[i - 1]) * multiplier + result[i - 1]
         return result
+
+    @staticmethod
+    def _is_main_board_stock(market: int, code: str) -> bool:
+        """仅保留沪深主板个股，排除科创板、创业板、北交所、指数和基金。"""
+        if market == 0:
+            return code.startswith(("000", "001", "002", "003"))
+        if market == 1:
+            return code.startswith(("600", "601", "603", "605"))
+        return False
+
+    @staticmethod
+    def _stock_market(code: str) -> int:
+        """根据 A 股代码判断通达信市场：0=深圳，1=上海。"""
+        if code.startswith(("600", "601", "603", "605", "688")):
+            return 1
+        return 0
 
     # ==================== 金叉/死叉检测 ====================
 
@@ -386,8 +403,8 @@ class ScreenerService:
 
     # ==================== 涨幅计算 ====================
 
-    def _check_cross_rise(self, close: np.ndarray, crosses: List[CrossEvent]) -> Optional[float]:
-        """计算最新金叉→死叉之间的涨幅"""
+    def _check_cross_rise(self, close: np.ndarray, crosses: List[CrossEvent]) -> Optional[Tuple[float, int, int]]:
+        """计算最新完整金叉→死叉区间内的最大收盘涨幅"""
         if len(crosses) < 2:
             return None
 
@@ -395,18 +412,24 @@ class ScreenerService:
         last = crosses[-1]
 
         if second_last.cross_type == "golden" and last.cross_type == "death":
-            golden_price, death_price = second_last.price, last.price
+            golden, death = second_last, last
         elif second_last.cross_type == "death" and last.cross_type == "golden":
             if len(crosses) >= 3 and crosses[-3].cross_type == "golden":
-                golden_price, death_price = crosses[-3].price, second_last.price
+                golden, death = crosses[-3], second_last
             else:
                 return None
         else:
             return None
 
-        if golden_price <= 0:
+        if golden.price <= 0 or golden.index >= death.index:
             return None
-        return (death_price - golden_price) / golden_price
+
+        window = close[golden.index:death.index + 1]
+        if len(window) == 0 or np.all(np.isnan(window)):
+            return None
+
+        max_close = float(np.nanmax(window))
+        return (max_close - golden.price) / golden.price, golden.index, death.index
 
     # ==================== 综合评分 ====================
 
