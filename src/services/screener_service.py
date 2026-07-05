@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -273,16 +274,97 @@ class ScreenerService:
                 self.MIN_EXPECTED_POOL_SIZE,
                 best_stats,
             )
-            em_pool, em_stats = self._build_pool_from_eastmoney()
-            if len(em_pool) > len(best_pool):
-                logger.info("[Screener] 使用东方财富免费列表补全股票池: 有效=%s, %s", len(em_pool), em_stats)
-                best_pool = em_pool
-                best_stats = f"东方财富免费列表, {em_stats}"
+            fallback_pool, fallback_stats = self._build_pool_from_free_providers()
+            if len(fallback_pool) > len(best_pool):
+                logger.info("[Screener] 使用免费行情列表补全股票池: 有效=%s, %s", len(fallback_pool), fallback_stats)
+                best_pool = fallback_pool
+                best_stats = fallback_stats
 
         logger.info("[Screener] 股票池构建完成: 有效=%s, 来源=%s", len(best_pool), best_stats)
         if best_host is not None:
             self._preferred_data_hosts = [best_host] + [item for item in hosts if item != best_host]
         return best_pool
+
+    def _build_pool_from_free_providers(self) -> Tuple[List[Tuple[str, str]], str]:
+        """依次使用项目已有免费行情库补全股票池。"""
+        providers = [
+            ("efinance", self._build_pool_from_efinance),
+            ("akshare", self._build_pool_from_akshare),
+            ("eastmoney_http", self._build_pool_from_eastmoney),
+        ]
+        best_pool: List[Tuple[str, str]] = []
+        best_stats = ""
+
+        for provider_name, provider in providers:
+            try:
+                pool, stats = provider()
+            except Exception as e:
+                logger.warning("[Screener] %s 股票池兜底失败: %s", provider_name, e)
+                continue
+
+            logger.info("[Screener] %s 股票池兜底候选: 有效=%s, %s", provider_name, len(pool), stats)
+            if len(pool) > len(best_pool):
+                best_pool = pool
+                best_stats = f"{provider_name}, {stats}"
+            if len(best_pool) >= self.MIN_EXPECTED_POOL_SIZE:
+                break
+
+        return best_pool, best_stats
+
+    def _build_pool_from_efinance(self) -> Tuple[List[Tuple[str, str]], str]:
+        """使用 efinance 获取 A 股列表，仅取代码和名称。"""
+        import efinance as ef
+
+        df = ef.stock.get_realtime_quotes()
+        return self._build_pool_from_dataframe(df, "efinance")
+
+    def _build_pool_from_akshare(self) -> Tuple[List[Tuple[str, str]], str]:
+        """使用 AkShare 获取 A 股列表，仅取代码和名称。"""
+        import akshare as ak
+
+        df = ak.stock_zh_a_spot_em()
+        return self._build_pool_from_dataframe(df, "akshare")
+
+    def _build_pool_from_dataframe(self, df: pd.DataFrame, source: str) -> Tuple[List[Tuple[str, str]], str]:
+        """从 DataFrame 标准化股票池，兼容 efinance / akshare 字段名。"""
+        if df is None or df.empty:
+            return [], f"{source}=empty"
+
+        code_columns = ["股票代码", "代码", "code", "f12"]
+        name_columns = ["股票名称", "名称", "name", "f14"]
+        records = df.to_dict("records")
+        return self._build_pool_from_records(records, code_columns, name_columns, source)
+
+    def _build_pool_from_records(
+        self,
+        records: List[dict],
+        code_columns: List[str],
+        name_columns: List[str],
+        source: str,
+    ) -> Tuple[List[Tuple[str, str]], str]:
+        """从记录列表中提取沪深主板、非 ST 股票。"""
+        pool_map = {}
+        counts = {0: 0, 1: 0}
+
+        for row in records:
+            code = self._normalize_stock_code(self._pick_first(row, code_columns))
+            name = str(self._pick_first(row, name_columns) or "").strip()
+            if not code or not name:
+                continue
+            if self._is_st_stock(name):
+                continue
+
+            market = self._stock_market(code)
+            if not self._is_main_board_stock(market, code):
+                continue
+
+            key = f"{market}:{code}"
+            if key not in pool_map:
+                counts[market] += 1
+            pool_map[key] = (code, name)
+
+        stats = f"{source}: 深市主板={counts[0]}, 沪市主板={counts[1]}, 原始={len(records)}"
+        return list(pool_map.values()), stats
 
     def _build_pool_from_eastmoney(self) -> Tuple[List[Tuple[str, str]], str]:
         """使用东方财富免费行情列表补齐股票池，仅取代码和名称。"""
@@ -300,7 +382,7 @@ class ScreenerService:
             rows = self._fetch_eastmoney_list(fs)
             accepted = 0
             for row in rows:
-                code = str(row.get("f12", "")).strip()
+                code = self._normalize_stock_code(row.get("f12", ""))
                 name = str(row.get("f14", "")).strip()
                 if not code or not name:
                     continue
@@ -564,6 +646,28 @@ class ScreenerService:
         """判断股票名称是否为 ST 或退市风险标的。"""
         normalized = str(name or "").strip().upper()
         return "ST" in normalized or "退" in normalized
+
+    @staticmethod
+    def _pick_first(row: dict, columns: List[str]):
+        """从多个候选字段中取第一个非空值。"""
+        for column in columns:
+            value = row.get(column)
+            if value is not None and str(value).strip():
+                return value
+        return None
+
+    @staticmethod
+    def _normalize_stock_code(raw_code) -> str:
+        """标准化股票代码为 6 位数字。"""
+        raw = str(raw_code or "").strip().upper()
+        if not raw:
+            return ""
+        if "." in raw:
+            raw = raw.split(".", 1)[0]
+        if raw.startswith(("SH", "SZ", "BJ")):
+            raw = raw[2:]
+        match = re.search(r"\d{6}", raw)
+        return match.group(0) if match else ""
 
     def _tdx_hosts(self) -> List[Tuple[str, int]]:
         """合并环境变量、项目默认、pytdx 自带和补充通达信主站。"""
