@@ -14,6 +14,7 @@ ScreenerService - 全市场条件选股服务
 from __future__ import annotations
 
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -65,6 +66,26 @@ class ScreenerService:
     MACD_MIN = -3.0
     MACD_MAX = 0.0
     MAX_WORKERS = 10
+    CONNECT_TIMEOUT = float(os.getenv("PYTDX_CONNECT_TIMEOUT", "3"))
+    EXTRA_TDX_HOSTS: List[Tuple[str, int]] = [
+        ("114.80.63.12", 7709),
+        ("114.80.63.35", 7709),
+        ("124.74.236.94", 7709),
+        ("218.75.126.9", 7709),
+        ("115.238.90.165", 7709),
+        ("115.238.56.198", 7709),
+        ("218.108.98.244", 7709),
+        ("218.108.47.69", 7709),
+        ("14.17.75.71", 7709),
+        ("180.153.18.170", 7709),
+        ("180.153.18.171", 7709),
+        ("180.153.18.172", 7709),
+        ("202.108.253.130", 7709),
+        ("60.191.117.167", 7709),
+        ("jstdx.gtjas.com", 7709),
+        ("shtdx.gtjas.com", 7709),
+        ("sztdx.gtjas.com", 7709),
+    ]
 
     def __init__(self):
         """初始化筛选服务，直接使用 pytdx 直连通达信"""
@@ -193,23 +214,28 @@ class ScreenerService:
         """
         from pytdx.hq import TdxHq_API
 
-        hosts = _parse_hosts_from_env()
-        if hosts is None:
-            hosts = PytdxFetcher.DEFAULT_HOSTS
+        hosts = self._tdx_hosts()
+        failed_hosts = []
 
         api = TdxHq_API()
         connected = False
         try:
             for host, port in hosts:
                 try:
-                    if api.connect(host, port, time_out=5):
+                    if api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
                         connected = True
+                        logger.info("[Screener] 通达信股票池连接成功: %s:%s", host, port)
                         break
-                except Exception:
-                    continue
+                    failed_hosts.append(f"{host}:{port}=connect_false")
+                except Exception as e:
+                    failed_hosts.append(f"{host}:{port}={e}")
 
             if not connected:
-                logger.error("[Screener] 无法连接任何通达信服务器")
+                logger.error(
+                    "[Screener] 无法连接任何通达信服务器，已尝试 %s 个: %s",
+                    len(hosts),
+                    "; ".join(failed_hosts[:20]),
+                )
                 return []
 
             pool_map = {}
@@ -296,14 +322,12 @@ class ScreenerService:
         from pytdx.hq import TdxHq_API
 
         market = self._stock_market(code)
-        hosts = _parse_hosts_from_env()
-        if hosts is None:
-            hosts = PytdxFetcher.DEFAULT_HOSTS
+        hosts = self._tdx_hosts()
 
         for host, port in hosts:
             api = TdxHq_API()
             try:
-                if not api.connect(host, port, time_out=5):
+                if not api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
                     continue
                 data = api.get_security_bars(
                     category=9,  # 日线
@@ -381,6 +405,50 @@ class ScreenerService:
         if code.startswith(("600", "601", "603", "605", "688")):
             return 1
         return 0
+
+    def _tdx_hosts(self) -> List[Tuple[str, int]]:
+        """合并环境变量、项目默认、pytdx 自带和补充通达信主站。"""
+        hosts: List[Tuple[str, int]] = []
+        env_hosts = _parse_hosts_from_env()
+        if env_hosts:
+            hosts.extend(env_hosts)
+
+        hosts.extend(getattr(PytdxFetcher, "DEFAULT_HOSTS", []))
+        hosts.extend(self._pytdx_config_hosts())
+        hosts.extend(self.EXTRA_TDX_HOSTS)
+
+        seen = set()
+        unique_hosts = []
+        for host, port in hosts:
+            key = (str(host).strip(), int(port))
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            unique_hosts.append(key)
+        return unique_hosts
+
+    @staticmethod
+    def _pytdx_config_hosts() -> List[Tuple[str, int]]:
+        """读取 pytdx 包内置 host 配置，兼容不同版本的数据结构。"""
+        try:
+            from pytdx.config.hosts import hq_hosts
+        except Exception:
+            return []
+
+        result: List[Tuple[str, int]] = []
+        for item in hq_hosts:
+            if isinstance(item, dict):
+                host = item.get("ip") or item.get("host")
+                port = item.get("port", 7709)
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                host, port = item[0], item[1]
+            else:
+                continue
+            try:
+                result.append((str(host), int(port)))
+            except Exception:
+                continue
+        return result
 
     # ==================== 金叉/死叉检测 ====================
 

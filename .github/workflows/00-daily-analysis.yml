@@ -259,6 +259,10 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          PYTDX_SERVERS: ${{ vars.PYTDX_SERVERS || secrets.PYTDX_SERVERS }}
+          PYTDX_HOST: ${{ vars.PYTDX_HOST || secrets.PYTDX_HOST }}
+          PYTDX_PORT: ${{ vars.PYTDX_PORT || secrets.PYTDX_PORT }}
+          PYTDX_CONNECT_TIMEOUT: ${{ vars.PYTDX_CONNECT_TIMEOUT || secrets.PYTDX_CONNECT_TIMEOUT || '3' }}
           # Longbridge OpenAPI（美股/港股实时行情字段补充；不设则仅 YFinance/AkShare，无 [Longbridge] 调用）
           LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
           LONGBRIDGE_OAUTH_TOKEN_CACHE_B64: ${{ secrets.LONGBRIDGE_OAUTH_TOKEN_CACHE_B64 }}
@@ -452,6 +456,7 @@ jobs:
           echo ""
           echo "【数据源】"
           echo "  Tushare Token: $([ -n "$TUSHARE_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  Pytdx Servers: $([ -n "$PYTDX_SERVERS" ] && echo '✅ 已配置' || echo '⚪ 使用内置列表')"
           if [ -n "$LONGBRIDGE_APP_KEY" ] && [ -n "$LONGBRIDGE_APP_SECRET" ] && [ -n "$LONGBRIDGE_ACCESS_TOKEN" ]; then
             echo "  Longbridge: ✅ 已配置（Legacy API Key）"
           elif [ -n "$LONGBRIDGE_OAUTH_CLIENT_ID" ] || { [ -n "$LONGBRIDGE_APP_KEY" ] && [ -z "$LONGBRIDGE_ACCESS_TOKEN" ]; }; then
