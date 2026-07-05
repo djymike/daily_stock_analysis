@@ -15,6 +15,7 @@
 """
 
 import logging
+import os
 import random
 import time
 from threading import BoundedSemaphore, RLock, Thread
@@ -1154,6 +1155,7 @@ class DataFetcherManager:
         from src.config import get_config
         from .efinance_fetcher import EfinanceFetcher
         from .tencent_fetcher import TencentFetcher
+        from .asharehub_fetcher import AShareHubFetcher
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher
         from .tickflow_fetcher import TickFlowFetcher
@@ -1170,6 +1172,12 @@ class DataFetcherManager:
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
         optional_fetchers: List[BaseFetcher] = []
+
+        asharehub_api_key = (os.getenv("ASHAREHUB_API_KEY") or "").strip()
+        if asharehub_api_key:
+            optional_fetchers.append(AShareHubFetcher(api_key=asharehub_api_key))
+        else:
+            logger.debug("[数据源初始化] 跳过未配置的 AShareHubFetcher")
 
         tushare_token = (getattr(config, "tushare_token", None) or "").strip()
         if tushare_token:
@@ -2148,6 +2156,8 @@ class DataFetcherManager:
         candidate_fetchers = []
         # 直接遍历管理器已经按 priority 排好序的数据源列表
         for fetcher in self._get_fetchers_snapshot():
+            if not self._is_fetcher_available(fetcher, capability="chip_distribution"):
+                continue
             # 只处理实现了筹码分布逻辑的数据源
             if not hasattr(fetcher, 'get_chip_distribution'):
                 continue

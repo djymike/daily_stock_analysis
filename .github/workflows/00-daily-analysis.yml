@@ -255,6 +255,10 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          ASHAREHUB_API_KEY: ${{ secrets.ASHAREHUB_API_KEY }}
+          ASHAREHUB_BASE_URL: ${{ vars.ASHAREHUB_BASE_URL || secrets.ASHAREHUB_BASE_URL }}
+          ASHAREHUB_TIMEOUT_SECONDS: ${{ vars.ASHAREHUB_TIMEOUT_SECONDS || secrets.ASHAREHUB_TIMEOUT_SECONDS || '10' }}
+          ASHAREHUB_PRIORITY: ${{ vars.ASHAREHUB_PRIORITY || secrets.ASHAREHUB_PRIORITY || '-2' }}
           PYTDX_SERVERS: ${{ vars.PYTDX_SERVERS || secrets.PYTDX_SERVERS }}
           PYTDX_HOST: ${{ vars.PYTDX_HOST || secrets.PYTDX_HOST }}
           PYTDX_PORT: ${{ vars.PYTDX_PORT || secrets.PYTDX_PORT }}
