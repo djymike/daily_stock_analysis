@@ -10,6 +10,7 @@ ScreenerService - 全市场条件选股服务
   A. MACD ∈ (-3, 0)
   B. 收盘价 > MA60
   C. 最新金叉→死叉之间涨幅 ≥ 40%
+  D. 非 ST，且 DIFF ∈ [-2, 3]
 """
 from __future__ import annotations
 
@@ -69,6 +70,8 @@ class ScreenerService:
     MIN_RISE_PCT = 0.40
     MACD_MIN = -3.0
     MACD_MAX = 0.0
+    DIFF_MIN = -2.0
+    DIFF_MAX = 3.0
     MAX_WORKERS = int(os.getenv("SCREENER_MAX_WORKERS", "10"))
     CONNECT_TIMEOUT = float(os.getenv("PYTDX_CONNECT_TIMEOUT", "3"))
     MIN_EXPECTED_POOL_SIZE = int(os.getenv("SCREENER_MIN_POOL_SIZE", "3000"))
@@ -163,8 +166,10 @@ class ScreenerService:
             "📊 **强势股回踩筛选报告**\n",
             "筛选项:",
             "• MACD: -3 ~ 0（回调整理阶段）",
+            "• DIFF: -2 ~ 3（指标位置不过热）",
             "• 股价 > MA60（中期趋势完好）",
-            "• 金叉→死叉涨幅 ≥ 40%（有主力拉升痕迹）\n",
+            "• 金叉→死叉涨幅 ≥ 40%（有主力拉升痕迹）",
+            "• 排除 ST / *ST\n",
             f"符合条件: {len(results)} 只",
             "━━━━━━━━━━━━━━━━━━━━",
         ]
@@ -195,7 +200,7 @@ class ScreenerService:
             "  强势股回踩筛选结果",
             "=" * 60,
             f"符合条件: {len(results)} 只",
-            f"条件: MACD∈(-3,0) + 股价>MA60 + 金叉→死叉涨幅≥40%",
+            f"条件: 非ST + MACD∈(-3,0) + DIFF∈[-2,3] + 股价>MA60 + 金叉→死叉涨幅≥40%",
             "-" * 60,
         ]
 
@@ -299,6 +304,8 @@ class ScreenerService:
                 name = str(row.get("f14", "")).strip()
                 if not code or not name:
                     continue
+                if self._is_st_stock(name):
+                    continue
                 if not self._is_main_board_stock(market, code):
                     continue
                 pool_map[f"{market}:{code}"] = (code, name)
@@ -391,6 +398,8 @@ class ScreenerService:
                         name = str(stock.get('name', ''))
                         if not code or not name:
                             continue
+                        if self._is_st_stock(name):
+                            continue
                         if not self._is_main_board_stock(market, code):
                             continue
                         key = f"{market}:{code}"
@@ -428,10 +437,15 @@ class ScreenerService:
 
         # 计算 MACD
         dif, dea, macd = self._compute_macd(close)
+        current_dif = float(dif[-1])
         current_macd = float(macd[-1])
 
         # 条件 A: MACD 在 -3 ~ 0
         if not (self.MACD_MIN < current_macd < self.MACD_MAX):
+            return None
+
+        # 条件 D: DIFF 在 -2 ~ 3
+        if not (self.DIFF_MIN <= current_dif <= self.DIFF_MAX):
             return None
 
         # 条件 C: 金叉→死叉涨幅
@@ -447,7 +461,7 @@ class ScreenerService:
 
         return ScreenerResult(
             code=code, name=name, score=score,
-            macd=current_macd, dif=float(dif[-1]), dea=float(dea[-1]),
+            macd=current_macd, dif=current_dif, dea=float(dea[-1]),
             price=latest_close, ma60=float(ma60),
             ma60_diff_pct=float(ma60_diff_pct),
             rise_since_golden=rise_pct,
@@ -544,6 +558,12 @@ class ScreenerService:
         if code.startswith(("600", "601", "603", "605", "688")):
             return 1
         return 0
+
+    @staticmethod
+    def _is_st_stock(name: str) -> bool:
+        """判断股票名称是否为 ST 或退市风险标的。"""
+        normalized = str(name or "").strip().upper()
+        return "ST" in normalized or "退" in normalized
 
     def _tdx_hosts(self) -> List[Tuple[str, int]]:
         """合并环境变量、项目默认、pytdx 自带和补充通达信主站。"""
