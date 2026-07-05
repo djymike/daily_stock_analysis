@@ -161,13 +161,13 @@ class ScreenerService:
         """格式化为飞书推送的 Markdown 文本"""
         if not results:
             return (
-                "📊 强势股回踩筛选报告\n\n"
+                "📊 回春票筛选报告\n\n"
                 "暂未发现符合条件的股票。\n\n"
                 f"筛选时间: {time.strftime('%Y-%m-%d %H:%M')}\n数据源: 通达信"
             )
 
         lines = [
-            "📊 **强势股回踩筛选报告**\n",
+            "📊 **回春票筛选报告**\n",
             "筛选项:",
             "• MACD: -3 ~ 0（回调整理阶段）",
             "• DIFF: -2 ~ 3（指标位置不过热）",
